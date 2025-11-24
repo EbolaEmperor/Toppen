@@ -25,7 +25,7 @@ TOTAL_TILES = TOTAL_TILES_PER_PLAYER * 2
 # AI 相关参数
 USE_AI = True          # 人机对战：人类 = 1，AI = 2
 AI_PLAYER = 2
-AI_SEARCH_DEPTH = 10    # 搜索深度（调大更聪明也更慢）
+AI_SEARCH_DEPTH = 12    # 搜索深度（调大更聪明也更慢）
 
 
 # ====================== 基本游戏逻辑 ======================
@@ -128,6 +128,27 @@ def top_winner_if_single_stack(board: StackBoard) -> Optional[Player]:
     return board[r][c][-1]
 
 
+def check_bottom_control_winner(board: StackBoard) -> Optional[Player]:
+    """如果所有非空堆的最底层牌都属于同一玩家，则该玩家获胜。"""
+    cells = get_nonempty_cells(board)
+    if not cells:
+        return None
+    
+    first_r, first_c = cells[0]
+    if not board[first_r][first_c]:
+        return None
+    
+    potential_winner = board[first_r][first_c][0]
+    
+    for r, c in cells[1:]:
+        if not board[r][c]:
+            continue
+        if board[r][c][0] != potential_winner:
+            return None
+            
+    return potential_winner
+
+
 def find_highest_stack_winner(board: StackBoard) -> Player:
     """双方都无棋可走但还不止一堆时：找最高牌堆的顶牌所属玩家。"""
     cells = get_nonempty_cells(board)
@@ -221,6 +242,7 @@ def alpha_beta(board: StackBoard,
                consecutive_moves: int,
                last_mover: Optional[Player],
                last_move_coords: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+               switches_without_reduction: int,
                depth: int,
                alpha: float,
                beta: float,
@@ -233,6 +255,18 @@ def alpha_beta(board: StackBoard,
             return 10000.0
         else:
             return -10000.0
+
+    # 终局 1.5：底层控制获胜
+    winner_bottom = check_bottom_control_winner(board)
+    if winner_bottom is not None:
+        if winner_bottom == ai_player:
+            return 10000.0
+        else:
+            return -10000.0
+            
+    # 终局 1.8：平局判定
+    if switches_without_reduction >= 20:
+        return 0.0
 
     # 计算禁止走法：如果上一手跳过（即对方无棋可走），则不能移回原位
     forbidden_move = None
@@ -262,12 +296,21 @@ def alpha_beta(board: StackBoard,
                           consecutive_moves,
                           last_mover,
                           last_move_coords,  # 传递上一步的移动坐标，因为这一步没动
+                          switches_without_reduction, # pass 不改变堆数也不算换手（或者算？规则说换手了20次，pass导致换手）
+                          # 如果 pass 导致换手，应该 +1？
+                          # 规则：一个人连续移动不算换手。Pass 意味着换人。
+                          # 但 Pass 不会减少堆数。
+                          # 所以 Pass 应该增加 switches_without_reduction。
+                          # 除非 Pass 也不算“移动”？
+                          # 简单起见，Pass 导致换手，所以 +1。
                           depth - 1,
                           alpha,
                           beta,
                           ai_player)
 
     # 正常有棋可走
+    current_stack_count = len(get_nonempty_cells(board))
+    
     if current_player == ai_player:
         # 极大
         value = -inf
@@ -287,12 +330,22 @@ def alpha_beta(board: StackBoard,
                 new_board = simulate_move(board, src, dst)
                 if new_board is None:
                     continue
+                
+                # 更新平局计数
+                new_stack_count = len(get_nonempty_cells(new_board))
+                new_switches = switches_without_reduction
+                if new_stack_count < current_stack_count:
+                    new_switches = 0
+                elif new_consecutive == 1: # 发生了换手
+                    new_switches += 1
+                
                 child_val = alpha_beta(new_board,
                                        3 - current_player,
                                        False,
                                        new_consecutive,
                                        current_player,
                                        (src, dst),  # 更新最后一步移动坐标
+                                       new_switches,
                                        depth - 1,
                                        alpha,
                                        beta,
@@ -324,12 +377,22 @@ def alpha_beta(board: StackBoard,
                 new_board = simulate_move(board, src, dst)
                 if new_board is None:
                     continue
+                
+                # 更新平局计数
+                new_stack_count = len(get_nonempty_cells(new_board))
+                new_switches = switches_without_reduction
+                if new_stack_count < current_stack_count:
+                    new_switches = 0
+                elif new_consecutive == 1: # 发生了换手
+                    new_switches += 1
+
                 child_val = alpha_beta(new_board,
                                        3 - current_player,
                                        False,
                                        new_consecutive,
                                        current_player,
                                        (src, dst),  # 更新最后一步移动坐标
+                                       new_switches,
                                        depth - 1,
                                        alpha,
                                        beta,
@@ -350,6 +413,7 @@ def choose_ai_move(board: StackBoard,
                    consecutive_moves: int,
                    last_mover: Optional[Player],
                    forbidden_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+                   switches_without_reduction: int,
                    ai_player: Player,
                    depth: int) -> Tuple[Optional[Tuple[Tuple[int, int], Tuple[int, int]]], float]:
     """为 AI 选择一步走法，并返回评估分数。"""
@@ -359,6 +423,8 @@ def choose_ai_move(board: StackBoard,
 
     best_val = -inf
     best_moves: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    
+    current_stack_count = len(get_nonempty_cells(board))
 
     for (src, dst) in legal_moves:
         # 计算新的连续移动次数
@@ -376,12 +442,22 @@ def choose_ai_move(board: StackBoard,
             new_board = simulate_move(board, src, dst)
             if new_board is None:
                 continue
+            
+            # 更新平局计数
+            new_stack_count = len(get_nonempty_cells(new_board))
+            new_switches = switches_without_reduction
+            if new_stack_count < current_stack_count:
+                new_switches = 0
+            elif new_consecutive == 1: # 发生了换手
+                new_switches += 1
+            
             val = alpha_beta(new_board,
                              3 - current_player,
                              False,
                              new_consecutive,
                              current_player,
                              (src, dst),  # 传递当前移动作为 last_move_coords
+                             new_switches,
                              depth - 1,
                              -inf,
                              inf,
@@ -564,6 +640,7 @@ class ToppenWindow(QMainWindow):
         self.consecutive_moves: int = 0
         self.last_moving_player: Optional[Player] = None
         self.last_move_record: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+        self.switches_without_reduction: int = 0
 
         # AI 设置
         self.use_ai = USE_AI
@@ -647,12 +724,14 @@ class ToppenWindow(QMainWindow):
         self.consecutive_moves = 0
         self.last_moving_player = None
         self.last_move_record = None
+        self.switches_without_reduction = 0
         self.animating = False
         self.pending_board_after_move = None
         self.anim_next_player = None
         
         # 重置指示器
-        self.update_indicator(0.0)
+        self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+        self.indicator.setToolTip("AI 评估：未知")
         
         self.update_board_view()
         self.start_turn()
@@ -670,6 +749,17 @@ class ToppenWindow(QMainWindow):
             QMessageBox.information(self, "游戏结束",
                                     f"{name}获胜。")
             # self.status_label.setText(f"游戏结束：玩家 {winner} 获胜。")
+            self.new_game()
+            return
+
+        # 终局 1.5：底层控制获胜
+        winner_bottom = check_bottom_control_winner(self.board)
+        if winner_bottom is not None:
+            self.game_over = True
+            self.update_board_view()
+            name = "您" if winner_bottom == 1 else "电脑"
+            QMessageBox.information(self, "游戏结束",
+                                    f"{name}获胜（控制了所有底层）。")
             self.new_game()
             return
 
@@ -734,6 +824,7 @@ class ToppenWindow(QMainWindow):
                               self.consecutive_moves,
                               self.last_moving_player,
                               forbidden_move,
+                              self.switches_without_reduction,
                               self.ai_player,
                               AI_SEARCH_DEPTH)
         
@@ -761,6 +852,10 @@ class ToppenWindow(QMainWindow):
             # Human (Player 1) 必胜 -> 绿色
             color = "#00cc00"
             tooltip = "人类必胜"
+        elif abs(score) < 0.1:
+            # 平局 -> 蓝色
+            color = "blue"
+            tooltip = "预计平局"
         else:
             # 局势不明 -> 灰色
             color = "gray"
@@ -871,6 +966,9 @@ class ToppenWindow(QMainWindow):
         if self.animating:
             return
 
+        # 记录移动前的堆数
+        old_stack_count = len(get_nonempty_cells(self.board))
+
         if self.current_player == self.last_moving_player:
             self.consecutive_moves += 1
         else:
@@ -887,6 +985,13 @@ class ToppenWindow(QMainWindow):
             self.selected_cell = None
             self.update_board_view()
             return
+
+        # 更新无消减换手计数
+        new_stack_count = len(get_nonempty_cells(new_board))
+        if new_stack_count < old_stack_count:
+            self.switches_without_reduction = 0
+        elif self.consecutive_moves == 1: # 发生了换手
+            self.switches_without_reduction += 1
 
         self.animating = True
         self.anim_next_player = next_player
@@ -1021,6 +1126,13 @@ class ToppenWindow(QMainWindow):
             QMessageBox.information(self, "游戏结束",
                                     f"{l_name}违规：连续移动了 5 次。\n"
                                     f"{w_name}获胜。")
+            self.new_game()
+            return
+
+        if self.switches_without_reduction >= 20:
+            self.game_over = True
+            QMessageBox.information(self, "游戏结束",
+                                    "平局：连续 20 次换手未减少牌堆数量。")
             self.new_game()
             return
 
