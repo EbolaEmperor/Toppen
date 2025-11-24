@@ -5,7 +5,8 @@ from typing import List, Tuple, Optional
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout,
-    QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QAction, QToolBar, QPushButton
+    QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QAction, QToolBar, QPushButton,
+    QDialog, QCheckBox, QSpinBox, QDialogButtonBox, QGroupBox
 )
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap
 from PyQt5.QtCore import (
@@ -26,6 +27,94 @@ TOTAL_TILES = TOTAL_TILES_PER_PLAYER * 2
 USE_AI = True          # 人机对战：人类 = 1，AI = 2
 AI_PLAYER = 2
 AI_SEARCH_DEPTH = 12    # 搜索深度（调大更聪明也更慢）
+
+
+# ====================== 规则配置 ======================
+
+class GameRules:
+    def __init__(self):
+        self.anti_backtracking = True
+        self.n_move_rule = True
+        self.n_move_limit = 5
+        self.stalemate_rule = True
+        self.stalemate_limit = 20
+
+class SettingsDialog(QDialog):
+    def __init__(self, rules: GameRules, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("特殊规则设置")
+        self.resize(420, 380)
+        # 拷贝一份规则用于编辑，确认后再应用
+        self.rules = GameRules()
+        self.rules.anti_backtracking = rules.anti_backtracking
+        self.rules.n_move_rule = rules.n_move_rule
+        self.rules.n_move_limit = rules.n_move_limit
+        self.rules.stalemate_rule = rules.stalemate_rule
+        self.rules.stalemate_limit = rules.stalemate_limit
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 1. 反悔棋禁手
+        self.group_anti = QGroupBox("反悔棋禁手 (Anti-Backtracking)")
+        self.group_anti.setCheckable(True)
+        self.group_anti.setChecked(self.rules.anti_backtracking)
+        
+        layout_anti = QVBoxLayout()
+        lbl_anti = QLabel("禁止将刚移动过的棋子立刻移回原位，防止恶意循环。")
+        lbl_anti.setStyleSheet("color: #666; font-size: 12px;")
+        layout_anti.addWidget(lbl_anti)
+        self.group_anti.setLayout(layout_anti)
+        layout.addWidget(self.group_anti)
+
+        # 2. N 连动判负
+        self.group_n = QGroupBox("N 连动判负")
+        self.group_n.setCheckable(True)
+        self.group_n.setChecked(self.rules.n_move_rule)
+
+        layout_n = QHBoxLayout()
+        layout_n.addWidget(QLabel("最大允许连续行动次数:"))
+        self.sb_n_move = QSpinBox()
+        self.sb_n_move.setRange(3, 20)
+        self.sb_n_move.setValue(self.rules.n_move_limit)
+        layout_n.addWidget(self.sb_n_move)
+        layout_n.addStretch()
+        self.group_n.setLayout(layout_n)
+        layout.addWidget(self.group_n)
+
+        # 3. 无进展平局
+        self.group_s = QGroupBox("无进展平局")
+        self.group_s.setCheckable(True)
+        self.group_s.setChecked(self.rules.stalemate_rule)
+
+        layout_s = QHBoxLayout()
+        layout_s.addWidget(QLabel("最大无消减换手次数:"))
+        self.sb_stalemate = QSpinBox()
+        self.sb_stalemate.setRange(10, 100)
+        self.sb_stalemate.setValue(self.rules.stalemate_limit)
+        layout_s.addWidget(self.sb_stalemate)
+        layout_s.addStretch()
+        self.group_s.setLayout(layout_s)
+        layout.addWidget(self.group_s)
+
+        layout.addStretch()
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_rules(self):
+        self.rules.anti_backtracking = self.group_anti.isChecked()
+        self.rules.n_move_rule = self.group_n.isChecked()
+        self.rules.n_move_limit = self.sb_n_move.value()
+        self.rules.stalemate_rule = self.group_s.isChecked()
+        self.rules.stalemate_limit = self.sb_stalemate.value()
+        return self.rules
 
 
 # ====================== 基本游戏逻辑 ======================
@@ -243,6 +332,7 @@ def alpha_beta(board: StackBoard,
                last_mover: Optional[Player],
                last_move_coords: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
                switches_without_reduction: int,
+               rules: GameRules,
                depth: int,
                alpha: float,
                beta: float,
@@ -265,12 +355,12 @@ def alpha_beta(board: StackBoard,
             return -10000.0
             
     # 终局 1.8：平局判定
-    if switches_without_reduction >= 20:
+    if rules.stalemate_rule and switches_without_reduction >= rules.stalemate_limit:
         return 0.0
 
     # 计算禁止走法：如果上一手跳过（即对方无棋可走），则不能移回原位
     forbidden_move = None
-    if skipped_last and last_move_coords:
+    if rules.anti_backtracking and skipped_last and last_move_coords:
         src, dst = last_move_coords
         forbidden_move = (dst, src)
 
@@ -297,12 +387,7 @@ def alpha_beta(board: StackBoard,
                           last_mover,
                           last_move_coords,  # 传递上一步的移动坐标，因为这一步没动
                           switches_without_reduction, # pass 不改变堆数也不算换手（或者算？规则说换手了20次，pass导致换手）
-                          # 如果 pass 导致换手，应该 +1？
-                          # 规则：一个人连续移动不算换手。Pass 意味着换人。
-                          # 但 Pass 不会减少堆数。
-                          # 所以 Pass 应该增加 switches_without_reduction。
-                          # 除非 Pass 也不算“移动”？
-                          # 简单起见，Pass 导致换手，所以 +1。
+                          rules,
                           depth - 1,
                           alpha,
                           beta,
@@ -323,7 +408,7 @@ def alpha_beta(board: StackBoard,
                 new_consecutive = 1
             
             # 检查连续移动判负规则
-            if new_consecutive >= 5:
+            if rules.n_move_rule and new_consecutive >= rules.n_move_limit:
                 # AI 判负
                 child_val = -20000.0
             else:
@@ -346,6 +431,7 @@ def alpha_beta(board: StackBoard,
                                        current_player,
                                        (src, dst),  # 更新最后一步移动坐标
                                        new_switches,
+                                       rules,
                                        depth - 1,
                                        alpha,
                                        beta,
@@ -370,7 +456,7 @@ def alpha_beta(board: StackBoard,
                 new_consecutive = 1
             
             # 检查连续移动判负规则
-            if new_consecutive >= 5:
+            if rules.n_move_rule and new_consecutive >= rules.n_move_limit:
                 # 对手判负 -> AI 获胜
                 child_val = 20000.0
             else:
@@ -393,6 +479,7 @@ def alpha_beta(board: StackBoard,
                                        current_player,
                                        (src, dst),  # 更新最后一步移动坐标
                                        new_switches,
+                                       rules,
                                        depth - 1,
                                        alpha,
                                        beta,
@@ -414,6 +501,7 @@ def choose_ai_move(board: StackBoard,
                    last_mover: Optional[Player],
                    forbidden_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
                    switches_without_reduction: int,
+                   rules: GameRules,
                    ai_player: Player,
                    depth: int) -> Tuple[Optional[Tuple[Tuple[int, int], Tuple[int, int]]], float]:
     """为 AI 选择一步走法，并返回评估分数。"""
@@ -435,7 +523,7 @@ def choose_ai_move(board: StackBoard,
             new_consecutive = 1
         
         # 检查连续移动判负规则
-        if new_consecutive >= 5:
+        if rules.n_move_rule and new_consecutive >= rules.n_move_limit:
             # 这一步会导致 AI 判负，极差
             val = -20000.0
         else:
@@ -458,6 +546,7 @@ def choose_ai_move(board: StackBoard,
                              current_player,
                              (src, dst),  # 传递当前移动作为 last_move_coords
                              new_switches,
+                             rules,
                              depth - 1,
                              -inf,
                              inf,
@@ -641,6 +730,10 @@ class ToppenWindow(QMainWindow):
         self.last_moving_player: Optional[Player] = None
         self.last_move_record: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
         self.switches_without_reduction: int = 0
+        # 当对方被迫跳过时，禁止将刚走过的棋子移回原位
+        self.forbidden_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+        
+        self.rules = GameRules()
 
         # AI 设置
         self.use_ai = USE_AI
@@ -699,13 +792,24 @@ class ToppenWindow(QMainWindow):
         self.addToolBar(toolbar)
         
         new_game_btn = QPushButton("新游戏")
-        new_game_btn.setStyleSheet("font-size: 18px; padding: 6px 12px; font-weight: bold;")
+        new_game_btn.setStyleSheet("font-size: 14px; padding: 6px 12px; font-weight: bold;")
         new_game_btn.clicked.connect(self.new_game)
         toolbar.addWidget(new_game_btn)
+        
+        rules_btn = QPushButton("特殊规则")
+        rules_btn.setStyleSheet("font-size: 14px; padding: 6px 12px; font-weight: bold;")
+        rules_btn.clicked.connect(self.open_rules_dialog)
+        toolbar.addWidget(rules_btn)
 
         self.resize(550, 600)
 
     # ---------- 游戏控制 ----------
+
+    def open_rules_dialog(self):
+        dialog = SettingsDialog(self.rules, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.rules = dialog.get_rules()
+            self.new_game()
 
     def new_game(self):
         if self.animation is not None:
@@ -728,7 +832,7 @@ class ToppenWindow(QMainWindow):
         self.animating = False
         self.pending_board_after_move = None
         self.anim_next_player = None
-        
+        self.forbidden_move = None
         # 重置指示器
         self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
         self.indicator.setToolTip("AI 评估：未知")
@@ -764,12 +868,13 @@ class ToppenWindow(QMainWindow):
             return
 
         # 计算禁止走法：如果上一手跳过（即对方无棋可走），则不能移回原位
-        forbidden_move = None
-        if self.skipped_last_turn and self.last_move_record:
+        if self.rules.anti_backtracking and self.skipped_last_turn and self.last_move_record:
             src, dst = self.last_move_record
-            forbidden_move = (dst, src)
+            self.forbidden_move = (dst, src)
+        else:
+            self.forbidden_move = None
 
-        legal_moves = generate_legal_moves(self.board, self.current_player, forbidden_move)
+        legal_moves = generate_legal_moves(self.board, self.current_player, self.forbidden_move)
         if not legal_moves:
             # 无棋可走
             if self.skipped_last_turn:
@@ -805,7 +910,7 @@ class ToppenWindow(QMainWindow):
 
         if self.use_ai and self.current_player == self.ai_player:
             # 电脑回合，延迟执行以让 UI 刷新
-            QTimer.singleShot(50, lambda: self.run_ai_turn(forbidden_move))
+            QTimer.singleShot(50, lambda: self.run_ai_turn(self.forbidden_move))
         else:
             # 人类回合
             pass
@@ -825,6 +930,7 @@ class ToppenWindow(QMainWindow):
                               self.last_moving_player,
                               forbidden_move,
                               self.switches_without_reduction,
+                              self.rules,
                               self.ai_player,
                               AI_SEARCH_DEPTH)
         
@@ -914,14 +1020,11 @@ class ToppenWindow(QMainWindow):
             return
 
         # 检查是否是禁止的走法（例如对方无棋可走时不能移回原位）
-        if self.skipped_last_turn and self.last_move_record:
-            src, dst = self.last_move_record
-            forbidden_move = (dst, src)
-            if ((sr, sc), (r, c)) == forbidden_move:
-                self.flash_cell(sr, sc)
-                self.selected_cell = None
-                self.update_board_view()
-                return
+        if self.forbidden_move and ((sr, sc), (r, c)) == self.forbidden_move:
+            self.flash_cell(sr, sc)
+            self.selected_cell = None
+            self.update_board_view()
+            return
 
         # 合法走法 -> 动画移动
         self.skipped_last_turn = False
@@ -1113,26 +1216,28 @@ class ToppenWindow(QMainWindow):
         if self.pending_board_after_move is not None:
             self.board = self.pending_board_after_move
             self.pending_board_after_move = None
+        # 任何一次真实落子后，清除禁止回退的记号
+        self.forbidden_move = None
 
         self.animating = False
         self.update_board_view()
 
-        if self.consecutive_moves >= 5:
+        if self.rules.n_move_rule and self.consecutive_moves >= self.rules.n_move_limit:
             self.game_over = True
             loser = self.last_moving_player
             winner = 2 if loser == 1 else 1
             l_name = "您" if loser == 1 else "电脑"
             w_name = "您" if winner == 1 else "电脑"
             QMessageBox.information(self, "游戏结束",
-                                    f"{l_name}违规：连续移动了 5 次。\n"
+                                    f"{l_name}违规：连续移动了 {self.rules.n_move_limit} 次。\n"
                                     f"{w_name}获胜。")
             self.new_game()
             return
 
-        if self.switches_without_reduction >= 20:
+        if self.rules.stalemate_rule and self.switches_without_reduction >= self.rules.stalemate_limit:
             self.game_over = True
             QMessageBox.information(self, "游戏结束",
-                                    "平局：连续 20 次换手未减少牌堆数量。")
+                                    f"平局：连续 {self.rules.stalemate_limit} 次换手未减少牌堆数量。")
             self.new_game()
             return
 
