@@ -1,16 +1,20 @@
 import sys
 import random
+import json
+import os
+import time
 from math import inf
 from typing import List, Tuple, Optional
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout,
-    QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QAction, QToolBar, QPushButton,
-    QDialog, QCheckBox, QSpinBox, QDialogButtonBox, QGroupBox
+    QVBoxLayout, QHBoxLayout, QLabel, QMessageBox, QAction, QPushButton,
+    QDialog, QCheckBox, QSpinBox, QDialogButtonBox, QGroupBox, QFrame, QScrollArea,
+    QInputDialog
 )
-from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap
+from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QCursor, QPainterPath
 from PyQt5.QtCore import (
-    Qt, QSize, QRect, QPoint, QPropertyAnimation, QTimer
+    Qt, QSize, QRect, QPoint, QPropertyAnimation, QTimer, QEvent
 )
 
 Player = int                    # 1 或 2
@@ -26,7 +30,9 @@ TOTAL_TILES = TOTAL_TILES_PER_PLAYER * 2
 # AI 相关参数
 USE_AI = True          # 人机对战：人类 = 1，AI = 2
 AI_PLAYER = 2
-AI_SEARCH_DEPTH = 12    # 搜索深度（调大更聪明也更慢）
+AI_SEARCH_DEPTH = 12    # 初始搜索深度（会自适应增加）
+AI_MAX_SEARCH_TIME = 4.0  # 最大搜索时间（秒）
+AI_MIN_DEPTH_TIME = 1.0   # 如果搜索时间小于这个值，继续加深
 
 
 # ====================== 规则配置 ======================
@@ -42,7 +48,7 @@ class GameRules:
 class SettingsDialog(QDialog):
     def __init__(self, rules: GameRules, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("特殊规则设置")
+        self.setWindowTitle("Special Rules Settings")
         self.resize(420, 380)
         # 拷贝一份规则用于编辑，确认后再应用
         self.rules = GameRules()
@@ -58,25 +64,25 @@ class SettingsDialog(QDialog):
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # 1. 反悔棋禁手
-        self.group_anti = QGroupBox("反悔棋禁手 (Anti-Backtracking)")
+        # 1. Anti-Backtracking
+        self.group_anti = QGroupBox("Anti-Backtracking")
         self.group_anti.setCheckable(True)
         self.group_anti.setChecked(self.rules.anti_backtracking)
         
         layout_anti = QVBoxLayout()
-        lbl_anti = QLabel("禁止将刚移动过的棋子立刻移回原位，防止恶意循环。")
+        lbl_anti = QLabel("Prevents moving a piece back to its previous position immediately.")
         lbl_anti.setStyleSheet("color: #666; font-size: 12px;")
         layout_anti.addWidget(lbl_anti)
         self.group_anti.setLayout(layout_anti)
         layout.addWidget(self.group_anti)
 
-        # 2. N 连动判负
-        self.group_n = QGroupBox("N 连动判负")
+        # 2. N-Move Rule
+        self.group_n = QGroupBox("N-Move Rule")
         self.group_n.setCheckable(True)
         self.group_n.setChecked(self.rules.n_move_rule)
 
         layout_n = QHBoxLayout()
-        layout_n.addWidget(QLabel("最大允许连续行动次数:"))
+        layout_n.addWidget(QLabel("Maximum consecutive moves allowed:"))
         self.sb_n_move = QSpinBox()
         self.sb_n_move.setRange(3, 20)
         self.sb_n_move.setValue(self.rules.n_move_limit)
@@ -85,13 +91,13 @@ class SettingsDialog(QDialog):
         self.group_n.setLayout(layout_n)
         layout.addWidget(self.group_n)
 
-        # 3. 无进展平局
-        self.group_s = QGroupBox("无进展平局")
+        # 3. Stalemate Draw
+        self.group_s = QGroupBox("Stalemate Draw")
         self.group_s.setCheckable(True)
         self.group_s.setChecked(self.rules.stalemate_rule)
 
         layout_s = QHBoxLayout()
-        layout_s.addWidget(QLabel("最大无消减换手次数:"))
+        layout_s.addWidget(QLabel("Maximum turns without stack reduction:"))
         self.sb_stalemate = QSpinBox()
         self.sb_stalemate.setRange(10, 100)
         self.sb_stalemate.setValue(self.rules.stalemate_limit)
@@ -285,12 +291,74 @@ def generate_random_initial_board() -> StackBoard:
 
 # ====================== AI 评价函数 & 搜索 ======================
 
+def check_unfavorable_3_stack_pattern(board: StackBoard, ai_player: Player) -> bool:
+    """
+    Check if the board has an unfavorable pattern for AI:
+    - Exactly 3 stacks remain
+    - One stack is in the "middle" position (adjacent to both other stacks)
+    - The other two stacks are NOT adjacent to each other
+    - The middle stack has AI's piece at the bottom
+    - The two side stacks have opponent's pieces at the bottom
+    
+    This pattern is unfavorable because AI is trapped in the middle while
+    the opponent controls both sides.
+    """
+    cells = get_nonempty_cells(board)
+    if len(cells) != 3:
+        return False
+    
+    # Get bottom pieces for each stack (only consider bottom, not top)
+    stacks_info = []
+    for r, c in cells:
+        stack = board[r][c]
+        if not stack:
+            return False
+        bottom = stack[0]  # Only check bottom piece
+        stacks_info.append((r, c, bottom))
+    
+    opponent = 3 - ai_player
+    
+    # Find which stack is in the middle (adjacent to both other stacks)
+    for i in range(3):
+        middle_stack = stacks_info[i]
+        other_stacks = [stacks_info[j] for j in range(3) if j != i]
+        
+        middle_pos = (middle_stack[0], middle_stack[1])
+        other1_pos = (other_stacks[0][0], other_stacks[0][1])
+        other2_pos = (other_stacks[1][0], other_stacks[1][1])
+        
+        # Check if middle stack is adjacent to both other stacks
+        dist_to_other1 = abs(middle_pos[0] - other1_pos[0]) + abs(middle_pos[1] - other1_pos[1])
+        dist_to_other2 = abs(middle_pos[0] - other2_pos[0]) + abs(middle_pos[1] - other2_pos[1])
+        
+        # Middle stack must be adjacent (distance 1) to both other stacks
+        if dist_to_other1 != 1 or dist_to_other2 != 1:
+            continue
+        
+        # Check if the other two stacks are NOT adjacent to each other
+        dist_other1_other2 = abs(other1_pos[0] - other2_pos[0]) + abs(other1_pos[1] - other2_pos[1])
+        if dist_other1_other2 == 1:
+            # They are adjacent, so this is not the pattern we're looking for
+            continue
+        
+        # Now check bottom pieces:
+        # Middle stack should have AI's bottom piece
+        # Both side stacks should have opponent's bottom pieces
+        if (middle_stack[2] == ai_player and
+            other_stacks[0][2] == opponent and
+            other_stacks[1][2] == opponent):
+            return True
+    
+    return False
+
+
 def evaluate_board(board: StackBoard, ai_player: Player) -> float:
     """
-    简单启发式：
-    - 每堆：顶牌是 ai -> +高度^2；顶牌是对手 -> -高度^2
-    - 最高堆：额外 +/- 5 * 高度
-    - 总牌数差：*(0.5) 小修正
+    Simple heuristic:
+    - Each stack: top is ai -> +height^2; top is opponent -> -height^2
+    - Tallest stack: extra +/- 5 * height
+    - Total piece difference: *(0.5) small correction
+    - Penalty for unfavorable 3-stack pattern
     """
     score = 0.0
     cells = get_nonempty_cells(board)
@@ -322,6 +390,11 @@ def evaluate_board(board: StackBoard, ai_player: Player) -> float:
         score -= 5 * max_h
 
     score += (total_ai - total_op) * 0.5
+    
+    # Penalty for unfavorable 3-stack pattern
+    if check_unfavorable_3_stack_pattern(board, ai_player):
+        score -= 1000.0  # Significant penalty
+    
     return score
 
 
@@ -569,24 +642,25 @@ def choose_ai_move(board: StackBoard,
 class StackWidget(QWidget):
     """棋盘上的一个格子，用自绘实现伪 3D 牌堆。"""
 
-    def __init__(self, row: int, col: int, window: "ToppenWindow"):
-        super().__init__(window)
+    def __init__(self, row: int, col: int, container):
+        super().__init__(container)
         self.row = row
         self.col = col
-        self.window = window
+        self.container = container
         self.setMinimumSize(QSize(100, 100))
         self.setMaximumSize(QSize(120, 120))
         self.setAttribute(Qt.WA_StyledBackground, True)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.window.cell_clicked(self.row, self.col)
+            if hasattr(self.container, 'cell_clicked'):
+                self.container.cell_clicked(self.row, self.col)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        board = self.window.board
+        board = self.container.board
         stack = board[self.row][self.col]
 
         # 空格子：什么都不画（“不显示”）
@@ -628,7 +702,9 @@ class StackWidget(QWidget):
         start_x = (w - stack_total_w) / 2
         start_y = (h - stack_total_h) / 2
 
-        selected = (self.window.selected_cell == (self.row, self.col))
+        selected = False
+        if hasattr(self.container, 'selected_cell'):
+            selected = (self.container.selected_cell == (self.row, self.col))
 
         for index, player in enumerate(stack):
             # 从底到顶画 (index 0 是底)
@@ -718,7 +794,7 @@ class StackWidget(QWidget):
 class ToppenWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("登山家 Toppen")
+        self.setWindowTitle("Toppen")
 
         self.board: StackBoard = [[[] for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
         self.current_player: Player = 1
@@ -756,15 +832,45 @@ class ToppenWindow(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        # 顶部信息栏：显示 AI 评估状态
+        # 顶部信息栏：按钮和 AI 评估状态
         top_layout = QHBoxLayout()
+        
+        button_style = """
+            QPushButton {
+                background-color: white; border: 1px solid #ccc; border-radius: 4px; 
+                color: #333; font-size: 14px; padding: 6px 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #f5f5f5; border-color: #999; }
+            QPushButton:pressed { background-color: #e0e0e0; }
+        """
+        
+        new_game_btn = QPushButton("New Game")
+        new_game_btn.setStyleSheet(button_style)
+        new_game_btn.clicked.connect(self.new_game)
+        top_layout.addWidget(new_game_btn)
+        
+        rules_btn = QPushButton("Special Rules")
+        rules_btn.setStyleSheet(button_style)
+        rules_btn.clicked.connect(self.open_rules_dialog)
+        top_layout.addWidget(rules_btn)
+        
+        custom_btn = QPushButton("Custom Game")
+        custom_btn.setStyleSheet(button_style)
+        custom_btn.clicked.connect(self.open_custom_game)
+        top_layout.addWidget(custom_btn)
+        
+        load_btn = QPushButton("Load Game")
+        load_btn.setStyleSheet(button_style)
+        load_btn.clicked.connect(self.open_load_game)
+        top_layout.addWidget(load_btn)
+        
         top_layout.addStretch()
         
         self.indicator = QLabel()
         self.indicator.setFixedSize(20, 20)
         # 默认灰色
         self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
-        self.indicator.setToolTip("AI 评估：未知")
+        self.indicator.setToolTip("AI Evaluation: Unknown")
         top_layout.addWidget(self.indicator)
         
         main_layout.addLayout(top_layout)
@@ -787,23 +893,50 @@ class ToppenWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # 工具栏：新游戏
-        toolbar = QToolBar("MainToolbar")
-        self.addToolBar(toolbar)
-        
-        new_game_btn = QPushButton("新游戏")
-        new_game_btn.setStyleSheet("font-size: 14px; padding: 6px 12px; font-weight: bold;")
-        new_game_btn.clicked.connect(self.new_game)
-        toolbar.addWidget(new_game_btn)
-        
-        rules_btn = QPushButton("特殊规则")
-        rules_btn.setStyleSheet("font-size: 14px; padding: 6px 12px; font-weight: bold;")
-        rules_btn.clicked.connect(self.open_rules_dialog)
-        toolbar.addWidget(rules_btn)
-
         self.resize(550, 600)
 
     # ---------- 游戏控制 ----------
+
+    def open_custom_game(self):
+        dialog = BoardEditor(self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.start_custom_game(dialog.board)
+    
+    def open_load_game(self):
+        dialog = LoadGameDialog(self)
+        if dialog.exec_() == QDialog.Accepted and dialog.selected_board:
+            self.start_custom_game(dialog.selected_board)
+
+    def start_custom_game(self, custom_board: StackBoard):
+        if self.animation is not None:
+            self.animation.stop()
+            self.animation = None
+        if self.animation_widget is not None:
+            self.animation_widget.hide()
+            self.animation_widget.deleteLater()
+            self.animation_widget = None
+
+        # 深拷贝以防万一
+        self.board = [[stack.copy() for stack in row] for row in custom_board]
+        
+        self.current_player = 1
+        self.selected_cell = None
+        self.skipped_last_turn = False
+        self.game_over = False
+        self.consecutive_moves = 0
+        self.last_moving_player = None
+        self.last_move_record = None
+        self.switches_without_reduction = 0
+        self.animating = False
+        self.pending_board_after_move = None
+        self.anim_next_player = None
+        self.forbidden_move = None
+        
+        self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+        self.indicator.setToolTip("AI Evaluation: Unknown")
+        
+        self.update_board_view()
+        self.start_turn()
 
     def open_rules_dialog(self):
         dialog = SettingsDialog(self.rules, self)
@@ -835,7 +968,7 @@ class ToppenWindow(QMainWindow):
         self.forbidden_move = None
         # 重置指示器
         self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
-        self.indicator.setToolTip("AI 评估：未知")
+        self.indicator.setToolTip("AI Evaluation: Unknown")
         
         self.update_board_view()
         self.start_turn()
@@ -849,9 +982,9 @@ class ToppenWindow(QMainWindow):
         if winner is not None:
             self.game_over = True
             self.update_board_view()
-            name = "您" if winner == 1 else "电脑"
-            QMessageBox.information(self, "游戏结束",
-                                    f"{name}获胜。")
+            name = "You" if winner == 1 else "Computer"
+            QMessageBox.information(self, "Game Over",
+                                    f"{name} wins!")
             # self.status_label.setText(f"游戏结束：玩家 {winner} 获胜。")
             self.new_game()
             return
@@ -861,9 +994,9 @@ class ToppenWindow(QMainWindow):
         if winner_bottom is not None:
             self.game_over = True
             self.update_board_view()
-            name = "您" if winner_bottom == 1 else "电脑"
-            QMessageBox.information(self, "游戏结束",
-                                    f"{name}获胜（控制了所有底层）。")
+            name = "You" if winner_bottom == 1 else "Computer"
+            QMessageBox.information(self, "Game Over",
+                                    f"{name} wins (controls all bottom pieces)!")
             self.new_game()
             return
 
@@ -882,8 +1015,8 @@ class ToppenWindow(QMainWindow):
                 self.game_over = True
                 winner2 = find_highest_stack_winner(self.board)
                 self.update_board_view()
-                QMessageBox.information(self, "游戏结束",
-                                        f"平局：双方都没有合法走法。")
+                QMessageBox.information(self, "Game Over",
+                                        f"Draw: Neither player has legal moves.")
                 # self.status_label.setText(f"游戏结束：玩家 {winner2} 获胜。")
                 self.new_game()
                 return
@@ -923,26 +1056,72 @@ class ToppenWindow(QMainWindow):
         if self.game_over:
             return
 
-        move, score = choose_ai_move(self.board,
-                              self.current_player,
-                              self.skipped_last_turn,
-                              self.consecutive_moves,
-                              self.last_moving_player,
-                              forbidden_move,
-                              self.switches_without_reduction,
-                              self.rules,
-                              self.ai_player,
-                              AI_SEARCH_DEPTH)
+        # Adaptive depth search: start with initial depth, increase if search is fast
+        start_time = time.time()
+        best_move = None
+        best_score = -inf
+        current_depth = AI_SEARCH_DEPTH
+        max_depth = 50  # Safety limit
         
-        self.update_indicator(score)
+        while current_depth <= max_depth:
+            depth_start_time = time.time()
+            
+            move, score = choose_ai_move(self.board,
+                                  self.current_player,
+                                  self.skipped_last_turn,
+                                  self.consecutive_moves,
+                                  self.last_moving_player,
+                                  forbidden_move,
+                                  self.switches_without_reduction,
+                                  self.rules,
+                                  self.ai_player,
+                                  current_depth)
+            
+            depth_time = time.time() - depth_start_time
+            total_time = time.time() - start_time
+            
+            # Update best result (only if we found a valid move)
+            if move is not None:
+                best_move = move
+                best_score = score
+            elif best_move is None:
+                # No valid move found at this depth, but we haven't found any move yet
+                # Continue searching deeper in case a move appears
+                if depth_time < AI_MIN_DEPTH_TIME and total_time < AI_MAX_SEARCH_TIME:
+                    current_depth += 2
+                    continue
+                else:
+                    # Time is running out or search is slow, stop
+                    break
+            
+            # Check if we found a decisive result (win/loss)
+            # If score indicates a clear win/loss, we can stop
+            WIN_THRESHOLD = 5000.0
+            if abs(best_score) > WIN_THRESHOLD:
+                # Found a decisive result, use this depth
+                break
+            
+            # Check if we've exceeded max time
+            if total_time >= AI_MAX_SEARCH_TIME:
+                # Time limit reached, use current best result
+                break
+            
+            # If this depth search was very fast, try deeper
+            if depth_time < AI_MIN_DEPTH_TIME:
+                current_depth += 2  # Increase depth by 2 for efficiency
+            else:
+                # Search is taking longer, stop here
+                break
+        
+        self.update_indicator(best_score)
 
-        if move is None:
+        if best_move is None:
             self.skipped_last_turn = True
             self.current_player = 2 if self.current_player == 1 else 1
             self.start_turn()
             return
 
-        src, dst = move
+        src, dst = best_move
         self.animate_move(src, dst, next_player=2 if self.current_player == 1 else 1)
 
     def update_indicator(self, score: float):
@@ -953,19 +1132,19 @@ class ToppenWindow(QMainWindow):
         if score > WIN_THRESHOLD:
             # AI (Player 2) 必胜 -> 红色
             color = "red"
-            tooltip = "电脑必胜"
+            tooltip = "Computer wins"
         elif score < -WIN_THRESHOLD:
             # Human (Player 1) 必胜 -> 绿色
             color = "#00cc00"
-            tooltip = "人类必胜"
+            tooltip = "Human wins"
         elif abs(score) < 0.1:
             # 平局 -> 蓝色
             color = "blue"
-            tooltip = "预计平局"
+            tooltip = "Expected draw"
         else:
             # 局势不明 -> 灰色
             color = "gray"
-            tooltip = "局势不明"
+            tooltip = "Uncertain"
             
         self.indicator.setStyleSheet(f"background-color: {color}; border-radius: 10px; border: 1px solid #666;")
         self.indicator.setToolTip(tooltip)
@@ -1226,18 +1405,18 @@ class ToppenWindow(QMainWindow):
             self.game_over = True
             loser = self.last_moving_player
             winner = 2 if loser == 1 else 1
-            l_name = "您" if loser == 1 else "电脑"
-            w_name = "您" if winner == 1 else "电脑"
-            QMessageBox.information(self, "游戏结束",
-                                    f"{l_name}违规：连续移动了 {self.rules.n_move_limit} 次。\n"
-                                    f"{w_name}获胜。")
+            l_name = "You" if loser == 1 else "Computer"
+            w_name = "You" if winner == 1 else "Computer"
+            QMessageBox.information(self, "Game Over",
+                                    f"{l_name} violated: Made {self.rules.n_move_limit} consecutive moves.\n"
+                                    f"{w_name} wins!")
             self.new_game()
             return
 
         if self.rules.stalemate_rule and self.switches_without_reduction >= self.rules.stalemate_limit:
             self.game_over = True
-            QMessageBox.information(self, "游戏结束",
-                                    f"平局：连续 {self.rules.stalemate_limit} 次换手未减少牌堆数量。")
+            QMessageBox.information(self, "Game Over",
+                                    f"Draw: {self.rules.stalemate_limit} consecutive turns without stack reduction.")
             self.new_game()
             return
 
@@ -1254,6 +1433,679 @@ class ToppenWindow(QMainWindow):
         for row_widgets in self.cells:
             for cell in row_widgets:
                 cell.update()
+
+
+# ====================== 自定义局面编辑器 ======================
+
+class BoardEditor(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Game")
+        self.resize(600, 650)
+        
+        # 初始为空棋盘
+        self.board = [[[] for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
+        
+        # 拖拽状态
+        self.dragging_piece = None  # 1 或 2
+        self.drag_source = None     # 'supply' 或 (r, c)
+        self.drag_label = None
+        
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setStyleSheet("font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; font-size: 14px;")
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+        
+        # 1. Instructions
+        instr_group = QGroupBox("")
+        instr_layout = QVBoxLayout()
+        lbl_instr = QLabel("Drag to place pieces.")
+        lbl_instr.setStyleSheet("color: #555; line-height: 1.5;")
+        instr_layout.addWidget(lbl_instr)
+        instr_group.setLayout(instr_layout)
+        layout.addWidget(instr_group)
+        
+        # 2. 棋盘区域
+        grid_frame = QFrame()
+        grid_frame.setStyleSheet("background-color: #f9f9f9; border: 1px solid #ddd; border-radius: 8px;")
+        grid_layout = QGridLayout(grid_frame)
+        grid_layout.setSpacing(6)
+        grid_layout.setContentsMargins(15, 15, 15, 15)
+        
+        self.cells = []
+        for r in range(BOARD_ROWS):
+            row_widgets = []
+            for c in range(BOARD_COLS):
+                cell = StackWidget(r, c, self)
+                # 安装事件过滤器以处理拖拽
+                cell.installEventFilter(self)
+                grid_layout.addWidget(cell, r, c)
+                row_widgets.append(cell)
+            self.cells.append(row_widgets)
+            
+        layout.addWidget(grid_frame)
+        
+        # 3. 供应区 & 垃圾桶
+        supply_group = QGroupBox("")
+        supply_layout = QHBoxLayout()
+        supply_layout.setSpacing(20)
+        
+        # 辅助函数：创建带标签的图标容器
+        def create_supply_item(label_widget, text):
+            container = QWidget()
+            v_layout = QVBoxLayout(container)
+            v_layout.setContentsMargins(0, 0, 0, 0)
+            v_layout.setSpacing(5)
+            v_layout.addWidget(label_widget, 0, Qt.AlignCenter)
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("color: #666; font-size: 12px;")
+            v_layout.addWidget(lbl)
+            return container
+
+        # 玩家1
+        self.supply_p1 = QLabel()
+        self.supply_p1.setFixedSize(64, 64)
+        self.supply_p1.setStyleSheet("background-color: #eef; border: 2px dashed #aac; border-radius: 8px;")
+        self.supply_p1.setAlignment(Qt.AlignCenter)
+        self.draw_supply_icon(self.supply_p1, 1)
+        self.supply_p1.installEventFilter(self)
+        
+        # 玩家2
+        self.supply_p2 = QLabel()
+        self.supply_p2.setFixedSize(64, 64)
+        self.supply_p2.setStyleSheet("background-color: #fee; border: 2px dashed #caa; border-radius: 8px;")
+        self.supply_p2.setAlignment(Qt.AlignCenter)
+        self.draw_supply_icon(self.supply_p2, 2)
+        self.supply_p2.installEventFilter(self)
+        
+        # 垃圾桶
+        self.trash_bin = QLabel()
+        self.trash_bin.setFixedSize(64, 64)
+        self.trash_bin.setStyleSheet("background-color: #fff0f0; border: 2px solid #e57373; border-radius: 8px;")
+        self.trash_bin.setAlignment(Qt.AlignCenter)
+        self.draw_trash_icon(self.trash_bin)
+        self.trash_bin.installEventFilter(self)
+
+        supply_layout.addStretch()
+        supply_layout.addWidget(create_supply_item(self.supply_p1, "Player 1"))
+        supply_layout.addWidget(create_supply_item(self.supply_p2, "Player 2"))
+        supply_layout.addSpacing(20)
+        supply_layout.addWidget(create_supply_item(self.trash_bin, "Remove"))
+        supply_layout.addStretch()
+        
+        supply_group.setLayout(supply_layout)
+        layout.addWidget(supply_group)
+        
+        # 4. 底部栏（按钮）
+        bottom_layout = QHBoxLayout()
+        
+        btn_save = QPushButton("Save")
+        btn_save.setFixedSize(100, 36)
+        btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3; border: none; border-radius: 4px; color: white; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+            QPushButton:pressed { background-color: #1565C0; }
+        """)
+        btn_save.clicked.connect(self.save_game)
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setFixedSize(100, 36)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5; border: 1px solid #ccc; border-radius: 4px; color: #333;
+            }
+            QPushButton:hover { background-color: #e0e0e0; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        self.btn_start = QPushButton("Start Game")
+        self.btn_start.setFixedSize(120, 36)
+        self.btn_start.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50; border: none; border-radius: 4px; color: white; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:pressed { background-color: #3d8b40; }
+        """)
+        self.btn_start.clicked.connect(self.check_and_start)
+        
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(btn_save)
+        bottom_layout.addWidget(btn_cancel)
+        bottom_layout.addWidget(self.btn_start)
+        
+        layout.addLayout(bottom_layout)
+
+    def draw_trash_icon(self, label):
+        pixmap = QPixmap(60, 60)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制垃圾桶
+        painter.setPen(QPen(QColor("#e57373"), 2))
+        painter.setBrush(Qt.NoBrush)
+        
+        cx, cy = 30, 30
+        
+        # 桶身 (梯形)
+        body_top_w = 24
+        body_bottom_w = 20
+        body_h = 28
+        
+        path = QPainterPath()
+        path.moveTo(cx - body_top_w/2, cy - body_h/2 + 4)
+        path.lineTo(cx + body_top_w/2, cy - body_h/2 + 4)
+        path.lineTo(cx + body_bottom_w/2, cy + body_h/2 + 4)
+        path.lineTo(cx - body_bottom_w/2, cy + body_h/2 + 4)
+        path.closeSubpath()
+        painter.drawPath(path)
+        
+        # 桶盖
+        lid_w = 28
+        lid_h = 4
+        painter.drawRoundedRect(int(cx - lid_w/2), int(cy - body_h/2), int(lid_w), int(lid_h), 2, 2)
+        
+        # 提手
+        handle_w = 10
+        handle_h = 3
+        painter.drawArc(int(cx - handle_w/2), int(cy - body_h/2 - handle_h), int(handle_w), int(handle_h * 2), 0, 180 * 16)
+        
+        # 竖线纹理
+        painter.drawLine(int(cx - 4), int(cy - body_h/2 + 8), int(cx - 3), int(cy + body_h/2))
+        painter.drawLine(int(cx), int(cy - body_h/2 + 8), int(cx), int(cy + body_h/2))
+        painter.drawLine(int(cx + 4), int(cy - body_h/2 + 8), int(cx + 3), int(cy + body_h/2))
+        
+        painter.end()
+        label.setPixmap(pixmap)
+
+    def draw_supply_icon(self, label, player):
+        pixmap = QPixmap(60, 60)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        rect = QRect(5, 5, 50, 50)
+        if player == 1:
+            base_color = QColor(180, 210, 255)
+            border_color = QColor(20, 40, 90)
+        else:
+            base_color = QColor(255, 200, 200)
+            border_color = QColor(120, 30, 30)
+            
+        painter.setBrush(base_color)
+        painter.setPen(border_color)
+        painter.drawRoundedRect(rect, 6, 6)
+        
+        # 绘制图标 (与 StackWidget 保持一致)
+        icon_color = QColor(0, 30, 80) if player == 1 else QColor(80, 10, 10)
+        painter.setBrush(Qt.NoBrush)
+        pen = QPen(icon_color)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        
+        cx, cy = rect.center().x(), rect.center().y()
+        w_icon = rect.width()
+        h_icon = rect.height()
+        
+        if player == 1: # Human (Player 1)
+            # Head
+            head_r = int(w_icon * 0.14)
+            painter.drawEllipse(QPoint(cx, int(cy - h_icon * 0.15)), head_r, head_r)
+            # Body (Shoulders)
+            body_w = int(w_icon * 0.45)
+            body_h = int(h_icon * 0.3)
+            # Draw chord for shoulders (0 to 180 degrees is top half)
+            painter.drawChord(int(cx - body_w/2), int(cy - h_icon * 0.05), body_w, body_h * 2, 0, 180 * 16)
+        else: # Computer (Player 2)
+            # Screen
+            screen_w = int(w_icon * 0.45)
+            screen_h = int(h_icon * 0.32)
+            painter.drawRoundedRect(int(cx - screen_w/2), int(cy - h_icon * 0.2), screen_w, screen_h, 3, 3)
+            # Base/Stand
+            base_w = int(w_icon * 0.25)
+            base_h = int(h_icon * 0.06)
+            painter.drawRect(int(cx - base_w/2), int(cy + h_icon * 0.18), base_w, base_h)
+            # Neck
+            neck_w = int(w_icon * 0.1)
+            neck_h = int(h_icon * 0.1)
+            painter.drawRect(int(cx - neck_w/2), int(cy + h_icon * 0.12), neck_w, neck_h)
+            
+        painter.end()
+        label.setPixmap(pixmap)
+
+    def eventFilter(self, source, event):
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                if source == self.supply_p1:
+                    self.start_drag(1, 'supply', source)
+                    return True
+                elif source == self.supply_p2:
+                    self.start_drag(2, 'supply', source)
+                    return True
+                elif isinstance(source, StackWidget):
+                    r, c = source.row, source.col
+                    if self.board[r][c]:
+                        piece = self.board[r][c].pop()
+                        self.start_drag(piece, (r, c), source)
+                        source.update()
+                        return True
+                        
+        elif event.type() == QEvent.MouseMove:
+            if self.dragging_piece is not None and self.drag_label:
+                # 更新拖拽图标位置
+                pos = event.globalPos()
+                local_pos = self.mapFromGlobal(pos)
+                self.drag_label.move(local_pos - QPoint(30, 30))
+                return True
+                
+        elif event.type() == QEvent.MouseButtonRelease:
+            if self.dragging_piece is not None:
+                # 确定释放位置
+                pos = event.globalPos()
+                widget = QApplication.widgetAt(pos)
+                
+                dropped = False
+                if isinstance(widget, StackWidget) and widget.container == self:
+                    # 放置在格子上
+                    self.board[widget.row][widget.col].append(self.dragging_piece)
+                    widget.update()
+                    dropped = True
+                elif widget == self.trash_bin:
+                    # 扔进垃圾桶
+                    dropped = True # 视为成功处理（删除）
+                
+                if not dropped:
+                    # 还原
+                    if self.drag_source != 'supply':
+                        r, c = self.drag_source
+                        self.board[r][c].append(self.dragging_piece)
+                        self.cells[r][c].update()
+                
+                self.end_drag()
+                return True
+                
+        return super().eventFilter(source, event)
+
+    def start_drag(self, piece, source, source_widget):
+        self.dragging_piece = piece
+        self.drag_source = source
+        
+        # 创建拖拽图标
+        self.drag_label = QLabel(self)
+        self.drag_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.draw_supply_icon(self.drag_label, piece)
+        self.drag_label.resize(60, 60)
+        self.drag_label.show()
+        
+        # 初始位置
+        cursor_pos = self.mapFromGlobal(QCursor.pos())
+        self.drag_label.move(cursor_pos - QPoint(30, 30))
+
+    def end_drag(self):
+        if self.drag_label:
+            self.drag_label.deleteLater()
+            self.drag_label = None
+        self.dragging_piece = None
+        self.drag_source = None
+
+    def save_game(self):
+        # 检查连通性
+        if not is_connected(self.board):
+            QMessageBox.warning(self, "Invalid Layout", "All pieces must be connected (adjacent up, down, left, or right).")
+            return
+            
+        # 检查是否有棋子
+        cells = get_nonempty_cells(self.board)
+        if not cells:
+            QMessageBox.warning(self, "Invalid Layout", "Board cannot be empty.")
+            return
+        
+        # Get game name
+        name, ok = QInputDialog.getText(self, "Save Game", "Enter game name:", text="Custom Game")
+        if not ok or not name.strip():
+            return
+        
+        name = name.strip()
+        
+        # 加载现有游戏列表
+        games_file = "custom_games.json"
+        games = []
+        if os.path.exists(games_file):
+            try:
+                with open(games_file, 'r', encoding='utf-8') as f:
+                    games = json.load(f)
+            except:
+                games = []
+        
+        # 检查名称是否已存在
+        for i, game in enumerate(games):
+            if game.get('name') == name:
+                reply = QMessageBox.question(self, "Name Exists", 
+                                            f"Game name '{name}' already exists. Overwrite?",
+                                            QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    games[i] = {'name': name, 'board': self.board}
+                    break
+                else:
+                    return
+        else:
+            # 添加新游戏
+            games.append({'name': name, 'board': self.board})
+        
+        # 保存到文件
+        try:
+            with open(games_file, 'w', encoding='utf-8') as f:
+                json.dump(games, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Error saving game: {str(e)}")
+
+    def check_and_start(self):
+        # 检查连通性
+        if not is_connected(self.board):
+            QMessageBox.warning(self, "Invalid Layout", "All pieces must be connected (adjacent up, down, left, or right).")
+            return
+            
+        # 检查是否有棋子
+        cells = get_nonempty_cells(self.board)
+        if not cells:
+            QMessageBox.warning(self, "Invalid Layout", "Board cannot be empty.")
+            return
+            
+        self.accept()
+
+
+# ====================== 加载游戏对话框 ======================
+
+class GameThumbnail(QWidget):
+    """游戏缩略图控件"""
+    def __init__(self, game_data, dialog, parent=None):
+        super().__init__(parent)
+        self.game_data = game_data
+        self.board = game_data['board']
+        self.name = game_data['name']
+        self.dialog = dialog
+        self.is_selected = False
+        self.setFixedSize(120, 150)
+        self.setStyleSheet("""
+            QWidget {
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                background-color: white;
+            }
+            QWidget:hover {
+                border: 2px solid #2196F3;
+                background-color: #f0f8ff;
+            }
+        """)
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        w = self.width()
+        h = self.height()
+        
+        # 绘制标题
+        painter.setPen(QColor(0, 0, 0))
+        painter.setFont(painter.font())
+        text_rect = QRect(5, 5, w - 10, 20)
+        painter.drawText(text_rect, Qt.AlignCenter | Qt.TextWordWrap, self.name)
+        
+        # 绘制棋盘缩略图（确保是正方形）
+        board_size = min(w - 20, h - 30 - 20)
+        board_rect = QRect((w - board_size) // 2, 30, board_size, board_size)
+        cell_size = board_size // BOARD_COLS
+        
+        # 绘制背景网格
+        painter.setPen(QPen(QColor(200, 200, 200), 1))
+        for r in range(BOARD_ROWS + 1):
+            y = board_rect.top() + r * cell_size
+            painter.drawLine(board_rect.left(), y, board_rect.right(), y)
+        for c in range(BOARD_COLS + 1):
+            x = board_rect.left() + c * cell_size
+            painter.drawLine(x, board_rect.top(), x, board_rect.bottom())
+        
+        # 绘制棋子（用小方块表示，考虑堆叠）
+        base_piece_size = int(cell_size * 0.5)  # 基础大小，为堆叠留出空间
+        for r in range(BOARD_ROWS):
+            for c in range(BOARD_COLS):
+                stack = self.board[r][c]
+                if stack:
+                    # 计算堆叠的起始位置（居中）
+                    cell_left = board_rect.left() + c * cell_size
+                    cell_top = board_rect.top() + r * cell_size
+                    center_x = cell_left + cell_size // 2
+                    center_y = cell_top + cell_size // 2
+                    
+                    # 堆叠数量
+                    stack_height = len(stack)
+                    
+                    # 堆叠偏移量（每层向右下偏移）
+                    offset_step = 1.5
+                    max_offset = (stack_height - 1) * offset_step
+                    
+                    # 确保堆叠不会超出格子
+                    if max_offset + base_piece_size > cell_size * 0.8:
+                        offset_step = (cell_size * 0.8 - base_piece_size) / max(1, stack_height - 1)
+                    
+                    # 从底层到顶层绘制
+                    for idx, player in enumerate(stack):
+                        # 计算偏移（底层在左上，顶层在右下）
+                        offset_x = idx * offset_step
+                        offset_y = idx * offset_step
+                        
+                        # 计算当前层的位置
+                        piece_x = center_x - base_piece_size // 2 + offset_x
+                        piece_y = center_y - base_piece_size // 2 + offset_y
+                        
+                        rect = QRect(
+                            int(piece_x),
+                            int(piece_y),
+                            base_piece_size,
+                            base_piece_size
+                        )
+                        
+                        if player == 1:
+                            # 蓝色（玩家1）
+                            base_color = QColor(180, 210, 255)
+                            border_color = QColor(20, 40, 90)
+                        else:
+                            # 红色（玩家2）
+                            base_color = QColor(255, 200, 200)
+                            border_color = QColor(120, 30, 30)
+                        
+                        # 底层稍微暗一些，顶层亮一些
+                        depth = stack_height - 1 - idx
+                        factor = 1.0 - 0.1 * depth
+                        factor = max(0.7, factor)
+                        color = QColor(
+                            int(base_color.red() * factor),
+                            int(base_color.green() * factor),
+                            int(base_color.blue() * factor)
+                        )
+                        
+                        painter.setBrush(color)
+                        painter.setPen(border_color)
+                        painter.drawRoundedRect(rect, 2, 2)
+        
+        # 如果被选中，绘制蒙版和选中图标
+        if self.is_selected:
+            # 绘制半透明蓝色蒙版
+            overlay_color = QColor(33, 150, 243, 120)  # 半透明蓝色
+            painter.setBrush(overlay_color)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(self.rect(), 8, 8)
+            
+            # 绘制选中图标（右上角的勾选标记）
+            check_size = 24
+            check_x = w - check_size - 5
+            check_y = 5
+            
+            # 绘制圆形背景
+            check_bg_rect = QRect(check_x, check_y, check_size, check_size)
+            painter.setBrush(QColor(33, 150, 243))  # 蓝色背景
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(check_bg_rect)
+            
+            # 绘制白色勾选标记
+            pen = QPen(QColor(255, 255, 255), 3)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            # 勾选标记的路径（更平滑的勾）
+            check_path = QPainterPath()
+            center_x = check_x + check_size // 2
+            center_y = check_y + check_size // 2
+            check_path.moveTo(center_x - 4, center_y)
+            check_path.lineTo(center_x - 1, center_y + 3)
+            check_path.lineTo(center_x + 4, center_y - 2)
+            painter.drawPath(check_path)
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dialog.select_game(self.game_data)
+
+
+class LoadGameDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load Game")
+        self.resize(600, 500)
+        self.selected_board = None
+        
+        self.init_ui()
+        self.load_games()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # Title
+        title = QLabel("Select a game to load")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #333;")
+        layout.addWidget(title)
+        
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        scroll.setStyleSheet("QScrollArea { border: 1px solid #ddd; border-radius: 8px; }")
+        
+        # 内容区域（网格布局）
+        content_widget = QWidget()
+        self.grid_layout = QGridLayout(content_widget)
+        self.grid_layout.setSpacing(15)
+        self.grid_layout.setContentsMargins(15, 15, 15, 15)
+        # 确保靠左对齐
+        self.grid_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        
+        scroll.setWidget(content_widget)
+        layout.addWidget(scroll)
+        
+        # 按钮
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setFixedSize(100, 36)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #f5f5f5; border: 1px solid #ccc; border-radius: 4px; color: #333;
+            }
+            QPushButton:hover { background-color: #e0e0e0; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        self.btn_load = QPushButton("Load")
+        self.btn_load.setFixedSize(100, 36)
+        self.btn_load.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50; border: none; border-radius: 4px; color: white; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #45a049; }
+            QPushButton:pressed { background-color: #3d8b40; }
+        """)
+        self.btn_load.setEnabled(False)
+        self.btn_load.clicked.connect(self.accept)
+        
+        button_layout.addWidget(btn_cancel)
+        button_layout.addWidget(self.btn_load)
+        layout.addLayout(button_layout)
+        
+        self.content_widget = content_widget
+        self.selected_game = None
+    
+    def load_games(self):
+        games_file = "custom_games.json"
+        games = []
+        
+        if os.path.exists(games_file):
+            try:
+                with open(games_file, 'r', encoding='utf-8') as f:
+                    games = json.load(f)
+            except Exception as e:
+                QMessageBox.warning(self, "Load Failed", f"Error reading game list: {str(e)}")
+                return
+        
+        if not games:
+            no_games_label = QLabel("No saved games")
+            no_games_label.setAlignment(Qt.AlignCenter)
+            no_games_label.setStyleSheet("color: #999; font-size: 14px; padding: 40px;")
+            self.grid_layout.addWidget(no_games_label, 0, 0, 1, 4)
+            return
+        
+        # 每行显示4个，从上到下、从左到右排列
+        cols_per_row = 4
+        for i, game_data in enumerate(games):
+            row = i // cols_per_row
+            col = i % cols_per_row
+            thumbnail = GameThumbnail(game_data, self, self.content_widget)
+            # 确保每个widget靠左对齐
+            self.grid_layout.addWidget(thumbnail, row, col, Qt.AlignLeft | Qt.AlignTop)
+    
+    def select_game(self, game_data):
+        self.selected_game = game_data
+        self.selected_board = game_data['board']
+        self.btn_load.setEnabled(True)
+        
+        # 更新所有缩略图的选中状态
+        for i in range(self.grid_layout.count()):
+            item = self.grid_layout.itemAt(i)
+            if item:
+                widget = item.widget()
+                if isinstance(widget, GameThumbnail):
+                    if widget.game_data == game_data:
+                        widget.is_selected = True
+                        widget.setStyleSheet("""
+                            QWidget {
+                                border: 3px solid #2196F3;
+                                border-radius: 8px;
+                                background-color: white;
+                            }
+                        """)
+                    else:
+                        widget.is_selected = False
+                        widget.setStyleSheet("""
+                            QWidget {
+                                border: 2px solid #ddd;
+                                border-radius: 8px;
+                                background-color: white;
+                            }
+                            QWidget:hover {
+                                border: 2px solid #2196F3;
+                                background-color: #f0f8ff;
+                            }
+                        """)
+                    widget.update()
 
 
 def main():

@@ -1,53 +1,53 @@
-# 登山家 (Toppen) 游戏规则
+# Toppen Game Rules
 
-Toppen 是一款基于堆叠机制的抽象策略游戏。游戏的目标是通过移动和堆叠棋子，最终占据最高点。
+Toppen is an abstract strategy game based on a stacking mechanism. The goal is to move and stack pieces to eventually occupy the highest point.
 
-## 基本规则
+## Basic Rules
 
-1.  **棋盘与初始设置**
-    *   游戏在 4x4 的网格上进行。
-    *   共有 10 枚棋子（玩家与电脑各 5 枚）。
-    *   游戏开始时，棋子会随机堆叠生成一个连通的初始布局。
+1.  **Board and Initial Setup**
+    *   The game is played on a 4x4 grid.
+    *   There are 10 pieces total (5 for each player).
+    *   At the start, pieces are randomly stacked to form a connected initial layout.
 
-2.  **移动机制**
-    *   双方轮流行动。
-    *   玩家只能移动**己方颜色且位于堆叠最顶层**的棋子。
-    *   棋子只能移动到**相邻**（上、下、左、右）且**已有棋子**的格子上（不能移入空格子）。
-    *   **连通性原则**：移动后，棋盘上所有剩余的棋子堆必须保持**连通**。如果某一步移动会导致棋盘分裂成不相连的两部分，则该移动非法。
+2.  **Movement Mechanism**
+    *   Players take turns.
+    *   Players can only move **their own colored pieces that are on top of a stack**.
+    *   Pieces can only move to **adjacent** (up, down, left, right) cells that **already contain pieces** (cannot move to empty cells).
+    *   **Connectivity Principle**: After a move, all remaining piece stacks on the board must remain **connected**. If a move would split the board into disconnected parts, that move is illegal.
 
-3.  **跳过回合 (Pass)**
-    *   如果轮到某方行动时，没有任何合法的移动（例如所有己方棋子都被压住，或任何移动都会破坏连通性），该方必须**跳过**本回合。
+3.  **Passing a Turn**
+    *   If a player has no legal moves when it's their turn (e.g., all their pieces are buried, or any move would break connectivity), they must **pass** their turn.
 
-4.  **胜利条件**
-    *   **登顶获胜（主要目标）**：当棋盘上的所有棋子汇聚成**唯一的一堆**时，游戏立即结束。位于该堆**最顶层**的玩家获胜。
-    *   **底层控制获胜（Domination）**：如果当前棋盘上**所有**非空格子的**最底层**棋子都属于同一位玩家，该玩家立即获胜。
-    *   **高塔获胜（僵局判定）**：如果双方连续跳过回合（即双方都无路可走），游戏结束。此时检查棋盘上**最高**的一堆棋子，其顶层属于哪一方，哪一方就获胜。
+4.  **Victory Conditions**
+    *   **Summit Victory (Primary Goal)**: When all pieces on the board merge into a **single stack**, the game ends immediately. The player whose piece is on **top** of that stack wins.
+    *   **Bottom Control Victory (Domination)**: If the **bottom** piece of **all** non-empty cells belongs to the same player, that player wins immediately.
+    *   **Tower Victory (Stalemate Resolution)**: If both players pass consecutively (i.e., neither has legal moves), the game ends. The player whose piece is on top of the **tallest** stack wins.
 
 ---
 
-## 禁手与特殊规则
+## Special Rules
 
-为了增加策略深度并防止死循环，本游戏包含以下特殊规则。**这些规则可以在游戏界面的“特殊规则”菜单中进行开启/关闭或参数调整。**
+To increase strategic depth and prevent infinite loops, the game includes the following special rules. **These rules can be enabled/disabled or adjusted in the "Special Rules" menu in the game interface.**
 
-1.  **反悔棋禁手 (Anti-Backtracking)**
-    *   **触发条件**：当对手被迫跳过回合（Pass）时。
-    *   **规则**：你不能将刚刚移动过的棋子立刻移回它原来的位置。
-    *   **目的**：防止在一方无路可走时，优势方通过来回移动同一枚棋子造成死循环。
-    *   *默认开启。*
+1.  **Anti-Backtracking**
+    *   **Trigger**: When the opponent is forced to pass.
+    *   **Rule**: You cannot immediately move a piece back to its previous position.
+    *   **Purpose**: Prevents infinite loops when one player has no moves and the other moves the same piece back and forth.
+    *   *Enabled by default.*
 
-2.  **N 连动判负 (N-Move Rule)**
-    *   **规则**：如果一方连续行动达到 **N 次**（默认 N=5，即对手被迫连续跳过了 N-1 次），该方直接**判负**。
-    *   **目的**：防止优势方利用对手无路可走的情况恶意拖延游戏，强迫玩家尽快结束战斗。
-    *   *默认开启，默认限制为 5 次。*
+2.  **N-Move Rule**
+    *   **Rule**: If a player makes **N consecutive moves** (default N=5, meaning the opponent was forced to pass N-1 times), that player **loses**.
+    *   **Purpose**: Prevents a player from exploiting an opponent's lack of moves to stall the game, forcing players to end the game quickly.
+    *   *Enabled by default, default limit is 5 moves.*
 
-3.  **无进展平局 (Stalemate Draw)**
-    *   **规则**：如果连续 **N 次换手**（默认 N=20，双方交替行动，单方连续行动不计入）期间，棋盘上的**牌堆数量没有减少**，游戏判定为**平局**。
-    *   **目的**：防止游戏进入双方都无法取胜且互不相让的僵局。
-    *   *默认开启，默认限制为 20 次。*
+3.  **Stalemate Draw**
+    *   **Rule**: If after **N consecutive turns** (default N=20, alternating between players, consecutive moves by one player don't count), the **number of stacks on the board has not decreased**, the game is declared a **draw**.
+    *   **Purpose**: Prevents the game from entering a deadlock where neither player can win.
+    *   *Enabled by default, default limit is 20 turns.*
 
-## 界面说明
-*   **右上角圆点**：AI 局势分析指示器。
-    *   🟢 **绿色**：人类玩家存在必胜策略。
-    *   🔴 **红色**：电脑玩家存在必胜策略。
-    *   🔵 **蓝色**：AI 预测结局为平局。
-    *   ⚪ **灰色**：当前局势不明。
+## Interface Guide
+*   **Top-right indicator**: AI position evaluation indicator.
+    *   🟢 **Green**: Human player has a winning strategy.
+    *   🔴 **Red**: Computer player has a winning strategy.
+    *   🔵 **Blue**: AI predicts a draw.
+    *   ⚪ **Gray**: Current position is uncertain.
