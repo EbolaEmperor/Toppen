@@ -17,6 +17,25 @@ from PyQt5.QtCore import (
     Qt, QSize, QRect, QPoint, QPropertyAnimation, QTimer, QEvent
 )
 
+# ====================== 记忆化搜索 (Transposition Table) ======================
+
+TT_EXACT = 0
+TT_LOWER = 1
+TT_UPPER = 2
+
+# 全局置换表：Key -> (depth, value, flag)
+TRANSPOSITION_TABLE = {}
+
+def make_state_key(board, current_player, skipped_last, consecutive_moves, last_mover, switches_without_reduction, forbidden_move):
+    """生成局面的哈希键（使用 Tuple 以利用 Python 字典的冲突处理）。"""
+    # 将 board 转换为可哈希的 tuple 结构
+    board_tuple = tuple(
+        tuple(tuple(stack) for stack in row)
+        for row in board
+    )
+    return (board_tuple, current_player, skipped_last, consecutive_moves, last_mover, switches_without_reduction, forbidden_move)
+
+
 Player = int                    # 1 或 2
 StackBoard = List[List[List[Player]]]
 
@@ -410,7 +429,59 @@ def alpha_beta(board: StackBoard,
                alpha: float,
                beta: float,
                ai_player: Player) -> float:
-    """极大极小 + alpha-beta 剪枝。"""
+    """带记忆化的 Alpha-Beta 搜索入口。"""
+    # 1. 计算哈希键
+    # 注意：需要根据 skipped_last 和 last_move_coords 预判 forbidden_move，以保持 Key 的唯一性
+    f_move = None
+    if rules.anti_backtracking and skipped_last and last_move_coords:
+        src, dst = last_move_coords
+        f_move = (dst, src)
+        
+    key = make_state_key(board, current_player, skipped_last, consecutive_moves, last_mover, switches_without_reduction, f_move)
+    
+    # 2. 查表
+    if key in TRANSPOSITION_TABLE:
+        entry_depth, entry_val, entry_flag = TRANSPOSITION_TABLE[key]
+        if entry_depth >= depth:
+            if entry_flag == TT_EXACT:
+                return entry_val
+            elif entry_flag == TT_LOWER:
+                alpha = max(alpha, entry_val)
+            elif entry_flag == TT_UPPER:
+                beta = min(beta, entry_val)
+            
+            if alpha >= beta:
+                return entry_val
+
+    # 3. 计算
+    alpha_orig = alpha
+    val = _alpha_beta_compute(board, current_player, skipped_last, consecutive_moves, last_mover, last_move_coords, switches_without_reduction, rules, depth, alpha, beta, ai_player)
+    
+    # 4. 存表
+    flag = TT_EXACT
+    if val <= alpha_orig:
+        flag = TT_UPPER
+    elif val >= beta:
+        flag = TT_LOWER
+        
+    TRANSPOSITION_TABLE[key] = (depth, val, flag)
+    
+    return val
+
+
+def _alpha_beta_compute(board: StackBoard,
+               current_player: Player,
+               skipped_last: bool,
+               consecutive_moves: int,
+               last_mover: Optional[Player],
+               last_move_coords: Optional[Tuple[Tuple[int, int], Tuple[int, int]]],
+               switches_without_reduction: int,
+               rules: GameRules,
+               depth: int,
+               alpha: float,
+               beta: float,
+               ai_player: Player) -> float:
+    """极大极小 + alpha-beta 剪枝（实际计算逻辑）。"""
     # 终局 1：已经收缩成一堆
     winner_single = top_winner_if_single_stack(board)
     if winner_single is not None:
@@ -469,6 +540,13 @@ def alpha_beta(board: StackBoard,
     # 正常有棋可走
     current_stack_count = len(get_nonempty_cells(board))
     
+    # 单一走法延伸策略（Single Extension）
+    # 如果只有一个合法走法，这步是强制的，不应消耗搜索深度。
+    # 这样可以让搜索在这些分支上看得更远。
+    next_depth = depth - 1
+    if len(legal_moves) == 1 and depth > 0:
+        next_depth = depth
+
     if current_player == ai_player:
         # 极大
         value = -inf
@@ -505,7 +583,7 @@ def alpha_beta(board: StackBoard,
                                        (src, dst),  # 更新最后一步移动坐标
                                        new_switches,
                                        rules,
-                                       depth - 1,
+                                       next_depth,  # 使用计算好的 next_depth
                                        alpha,
                                        beta,
                                        ai_player)
@@ -553,7 +631,7 @@ def alpha_beta(board: StackBoard,
                                        (src, dst),  # 更新最后一步移动坐标
                                        new_switches,
                                        rules,
-                                       depth - 1,
+                                       next_depth,  # 使用计算好的 next_depth
                                        alpha,
                                        beta,
                                        ai_player)
@@ -822,6 +900,9 @@ class ToppenWindow(QMainWindow):
         self.pending_board_after_move: Optional[StackBoard] = None
         self.anim_next_player: Optional[Player] = None
 
+        # 悔棋栈
+        self.undo_stack = []
+
         self.init_ui()
         self.new_game()
 
@@ -868,8 +949,19 @@ class ToppenWindow(QMainWindow):
         
         self.indicator = QLabel()
         self.indicator.setFixedSize(20, 20)
-        # 默认灰色
-        self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+        # 默认灰色，同时应用白底黑字 Tooltip 样式
+        self.indicator.setStyleSheet("""
+            QLabel {
+                background-color: gray; 
+                border-radius: 10px; 
+                border: 1px solid #666;
+            }
+            QToolTip {
+                background-color: white;
+                color: black;
+                border: 1px solid black;
+            }
+        """)
         self.indicator.setToolTip("AI Evaluation: Unknown")
         top_layout.addWidget(self.indicator)
         
@@ -890,6 +982,36 @@ class ToppenWindow(QMainWindow):
                 self.grid.addWidget(cell, r, c)
                 row_widgets.append(cell)
             self.cells.append(row_widgets)
+            
+        # 底部栏：悔棋按钮
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        
+        self.undo_btn = QPushButton("↶")
+        self.undo_btn.setFixedSize(20, 20)
+        # 圆形按钮样式，与 indicator 保持一致的大小和圆角
+        self.undo_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f0f0f0; 
+                border: 1px solid #999; 
+                border-radius: 10px; 
+                color: #333; 
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+                border-color: #666;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+        self.undo_btn.setToolTip("Undo last move")
+        self.undo_btn.clicked.connect(self.undo_last_human_move)
+        bottom_layout.addWidget(self.undo_btn)
+        
+        main_layout.addLayout(bottom_layout)
 
         self.setCentralWidget(central)
 
@@ -908,6 +1030,8 @@ class ToppenWindow(QMainWindow):
             self.start_custom_game(dialog.selected_board)
 
     def start_custom_game(self, custom_board: StackBoard):
+        TRANSPOSITION_TABLE.clear()  # 清空记忆化缓存
+        self.undo_stack.clear()      # 清空悔棋栈
         if self.animation is not None:
             self.animation.stop()
             self.animation = None
@@ -932,7 +1056,18 @@ class ToppenWindow(QMainWindow):
         self.anim_next_player = None
         self.forbidden_move = None
         
-        self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+        self.indicator.setStyleSheet("""
+            QLabel {
+                background-color: gray; 
+                border-radius: 10px; 
+                border: 1px solid #666;
+            }
+            QToolTip {
+                background-color: white;
+                color: black;
+                border: 1px solid black;
+            }
+        """)
         self.indicator.setToolTip("AI Evaluation: Unknown")
         
         self.update_board_view()
@@ -945,6 +1080,8 @@ class ToppenWindow(QMainWindow):
             self.new_game()
 
     def new_game(self):
+        TRANSPOSITION_TABLE.clear()  # 清空记忆化缓存
+        self.undo_stack.clear()      # 清空悔棋栈
         if self.animation is not None:
             self.animation.stop()
             self.animation = None
@@ -967,7 +1104,18 @@ class ToppenWindow(QMainWindow):
         self.anim_next_player = None
         self.forbidden_move = None
         # 重置指示器
-        self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+        self.indicator.setStyleSheet("""
+            QLabel {
+                background-color: gray; 
+                border-radius: 10px; 
+                border: 1px solid #666;
+            }
+            QToolTip {
+                background-color: white;
+                color: black;
+                border: 1px solid black;
+            }
+        """)
         self.indicator.setToolTip("AI Evaluation: Unknown")
         
         self.update_board_view()
@@ -1146,7 +1294,23 @@ class ToppenWindow(QMainWindow):
             color = "gray"
             tooltip = "Uncertain"
             
-        self.indicator.setStyleSheet(f"background-color: {color}; border-radius: 10px; border: 1px solid #666;")
+        # 修改 tooltip 样式：移除自定义背景色，使用默认白底黑字（或系统默认）
+        # 注意：QToolTip 的样式通常是全局设置，或者通过 stylesheet 设置 QToolTip
+        # 这里我们只设置 QLabel 的背景色，tooltip 样式让其保持默认或通过全局样式控制
+        # 如果需要强制白底黑字，可以在 app 级别设置，或者在这里给 label 设置 QToolTip 样式
+        
+        self.indicator.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color}; 
+                border-radius: 10px; 
+                border: 1px solid #666;
+            }}
+            QToolTip {{
+                background-color: white;
+                color: black;
+                border: 1px solid black;
+            }}
+        """)
         self.indicator.setToolTip(tooltip)
 
     def cell_clicked(self, r: int, c: int):
@@ -1207,8 +1371,80 @@ class ToppenWindow(QMainWindow):
 
         # 合法走法 -> 动画移动
         self.skipped_last_turn = False
+        
+        # 如果是人类玩家操作，记录快照以供悔棋
+        # 注意：这里假设人类玩家是 1，或者非 AI 玩家
+        if not (self.use_ai and self.current_player == self.ai_player):
+            self.save_state_for_undo()
+            
         self.animate_move((sr, sc), (r, c),
                           next_player=2 if self.current_player == 1 else 1)
+
+    def save_state_for_undo(self):
+        """保存当前状态快照到 undo_stack。"""
+        snapshot = {
+            'board': [[stack.copy() for stack in row] for row in self.board],
+            'current_player': self.current_player,
+            'skipped_last_turn': self.skipped_last_turn,
+            'game_over': self.game_over,
+            'consecutive_moves': self.consecutive_moves,
+            'last_moving_player': self.last_moving_player,
+            'last_move_record': self.last_move_record,
+            'switches_without_reduction': self.switches_without_reduction,
+            'forbidden_move': self.forbidden_move,
+            # 保存指示器状态
+            'indicator_style': self.indicator.styleSheet(),
+            'indicator_tooltip': self.indicator.toolTip()
+        }
+        self.undo_stack.append(snapshot)
+
+    def undo_last_human_move(self):
+        """撤回人类的上一手操作（如果中间有AI操作也一并撤回）。"""
+        if not self.undo_stack:
+            return
+
+        if self.animating:
+            return
+            
+        snapshot = self.undo_stack.pop()
+        
+        self.board = snapshot['board']
+        self.current_player = snapshot['current_player']
+        self.skipped_last_turn = snapshot['skipped_last_turn']
+        self.game_over = snapshot['game_over']
+        self.consecutive_moves = snapshot['consecutive_moves']
+        self.last_moving_player = snapshot['last_moving_player']
+        self.last_move_record = snapshot['last_move_record']
+        self.switches_without_reduction = snapshot['switches_without_reduction']
+        self.forbidden_move = snapshot['forbidden_move']
+        
+        # 恢复后清理选中状态
+        self.selected_cell = None
+        self.animating = False
+        self.pending_board_after_move = None
+        self.anim_next_player = None
+        
+        # 停止可能的 AI 思考或动画
+        if self.animation is not None:
+            self.animation.stop()
+            self.animation = None
+        if self.animation_widget is not None:
+            self.animation_widget.hide()
+            self.animation_widget.deleteLater()
+            self.animation_widget = None
+            
+        self.update_board_view()
+        
+        # 恢复 AI 指示器状态
+        if 'indicator_style' in snapshot:
+            self.indicator.setStyleSheet(snapshot['indicator_style'])
+            self.indicator.setToolTip(snapshot['indicator_tooltip'])
+        else:
+            # 兼容旧快照（如果有）
+            self.indicator.setStyleSheet("background-color: gray; border-radius: 10px; border: 1px solid #666;")
+            self.indicator.setToolTip("AI Evaluation: Unknown")
+        
+        # 恢复后不需要 start_turn，因为肯定是回到了人类待机状态
 
     # ---------- 动画 ----------
 
@@ -1493,17 +1729,13 @@ class BoardEditor(QDialog):
         supply_layout = QHBoxLayout()
         supply_layout.setSpacing(20)
         
-        # 辅助函数：创建带标签的图标容器
-        def create_supply_item(label_widget, text):
+        # 辅助函数：创建不带标签的图标容器
+        def create_supply_item(label_widget):
             container = QWidget()
             v_layout = QVBoxLayout(container)
             v_layout.setContentsMargins(0, 0, 0, 0)
             v_layout.setSpacing(5)
             v_layout.addWidget(label_widget, 0, Qt.AlignCenter)
-            lbl = QLabel(text)
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("color: #666; font-size: 12px;")
-            v_layout.addWidget(lbl)
             return container
 
         # 玩家1
@@ -1531,10 +1763,10 @@ class BoardEditor(QDialog):
         self.trash_bin.installEventFilter(self)
 
         supply_layout.addStretch()
-        supply_layout.addWidget(create_supply_item(self.supply_p1, "Player 1"))
-        supply_layout.addWidget(create_supply_item(self.supply_p2, "Player 2"))
+        supply_layout.addWidget(create_supply_item(self.supply_p1))
+        supply_layout.addWidget(create_supply_item(self.supply_p2))
         supply_layout.addSpacing(20)
-        supply_layout.addWidget(create_supply_item(self.trash_bin, "Remove"))
+        supply_layout.addWidget(create_supply_item(self.trash_bin))
         supply_layout.addStretch()
         
         supply_group.setLayout(supply_layout)
