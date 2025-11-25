@@ -33,17 +33,17 @@ To increase strategic depth and prevent infinite loops, the game includes the fo
     *   **Trigger**: When the opponent is forced to pass.
     *   **Rule**: You cannot immediately move a piece back to its previous position.
     *   **Purpose**: Prevents infinite loops when one player has no moves and the other moves the same piece back and forth.
-    *   *Enabled by default.*
+    *   *Disabled by default.*
 
 2.  **N-Move Rule**
     *   **Rule**: If a player makes **N consecutive moves** (default N=5, meaning the opponent was forced to pass N-1 times), that player **loses**.
     *   **Purpose**: Prevents a player from exploiting an opponent's lack of moves to stall the game, forcing players to end the game quickly.
-    *   *Enabled by default, default limit is 5 moves.*
+    *   *Enabled by default, default limit is 6 moves.*
 
 3.  **Stalemate Draw**
     *   **Rule**: If after **N consecutive turns** (default N=20, alternating between players, consecutive moves by one player don't count), the **number of stacks on the board has not decreased**, the game is declared a **draw**.
     *   **Purpose**: Prevents the game from entering a deadlock where neither player can win.
-    *   *Enabled by default, default limit is 20 turns.*
+    *   *Enabled by default, default limit is 30 turns.*
 
 ## Interface Guide
 *   **Top-right indicator**: AI position evaluation indicator.

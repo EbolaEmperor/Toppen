@@ -58,11 +58,11 @@ AI_MIN_DEPTH_TIME = 1.0   # 如果搜索时间小于这个值，继续加深
 
 class GameRules:
     def __init__(self):
-        self.anti_backtracking = True
+        self.anti_backtracking = False
         self.n_move_rule = True
-        self.n_move_limit = 5
+        self.n_move_limit = 6
         self.stalemate_rule = True
-        self.stalemate_limit = 20
+        self.stalemate_limit = 30
 
 class SettingsDialog(QDialog):
     def __init__(self, rules: GameRules, parent=None):
