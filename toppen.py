@@ -887,6 +887,10 @@ class ToppenWindow(QMainWindow):
         # 当对方被迫跳过时，禁止将刚走过的棋子移回原位
         self.forbidden_move: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
         
+        # AI Indicator state
+        self.indicator_visible = True
+        self.last_ai_score: Optional[float] = None
+        
         self.rules = GameRules()
 
         # AI 设置
@@ -949,6 +953,7 @@ class ToppenWindow(QMainWindow):
         
         self.indicator = QLabel()
         self.indicator.setFixedSize(20, 20)
+        self.indicator.setAlignment(Qt.AlignCenter)
         # 默认灰色，同时应用白底黑字 Tooltip 样式
         self.indicator.setStyleSheet("""
             QLabel {
@@ -963,6 +968,7 @@ class ToppenWindow(QMainWindow):
             }
         """)
         self.indicator.setToolTip("AI Evaluation: Unknown")
+        self.indicator.installEventFilter(self)
         top_layout.addWidget(self.indicator)
         
         main_layout.addLayout(top_layout)
@@ -1056,6 +1062,8 @@ class ToppenWindow(QMainWindow):
         self.anim_next_player = None
         self.forbidden_move = None
         
+        self.last_ai_score = None # Reset score
+        
         self.indicator.setStyleSheet("""
             QLabel {
                 background-color: gray; 
@@ -1072,6 +1080,18 @@ class ToppenWindow(QMainWindow):
         
         self.update_board_view()
         self.start_turn()
+    
+    def eventFilter(self, source, event):
+        if source == self.indicator and event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                self.toggle_indicator_visibility()
+                return True
+        return super().eventFilter(source, event)
+        
+    def toggle_indicator_visibility(self):
+        self.indicator_visible = not self.indicator_visible
+        # Force update using last known score
+        self.update_indicator(self.last_ai_score)
 
     def open_rules_dialog(self):
         dialog = SettingsDialog(self.rules, self)
@@ -1103,6 +1123,7 @@ class ToppenWindow(QMainWindow):
         self.pending_board_after_move = None
         self.anim_next_player = None
         self.forbidden_move = None
+        self.last_ai_score = None # Reset score
         # 重置指示器
         self.indicator.setStyleSheet("""
             QLabel {
@@ -1272,12 +1293,39 @@ class ToppenWindow(QMainWindow):
         src, dst = best_move
         self.animate_move(src, dst, next_player=2 if self.current_player == 1 else 1)
 
-    def update_indicator(self, score: float):
+    def update_indicator(self, score: Optional[float]):
         """根据 AI 评分更新指示器颜色。"""
+        self.last_ai_score = score
+        
+        if not self.indicator_visible:
+            # Hidden state: Dotted border without text
+            self.indicator.setText("")
+            self.indicator.setStyleSheet("""
+                QLabel {
+                    background-color: #f5f5f5; 
+                    border: 2px dotted #999;
+                    border-radius: 10px;
+                }
+                QToolTip {
+                    background-color: white;
+                    color: black;
+                    border: 1px solid black;
+                }
+            """)
+            self.indicator.setToolTip("AI Evaluation: Hidden (Click to show)")
+            return
+
+        # Visible state: Solid color, no text
+        self.indicator.setText("")
+        
         # 阈值设定：超过 5000 认为是必胜/必败
         WIN_THRESHOLD = 5000.0
         
-        if score > WIN_THRESHOLD:
+        if score is None:
+            # Unknown / Initial state -> Gray
+            color = "gray"
+            tooltip = "Unknown"
+        elif score > WIN_THRESHOLD:
             # AI (Player 2) 必胜 -> 红色
             color = "red"
             tooltip = "Computer wins"
@@ -2064,6 +2112,7 @@ class GameThumbnail(QWidget):
         self.name = game_data['name']
         self.dialog = dialog
         self.is_selected = False
+        self.is_checked = False
         self.setFixedSize(120, 150)
         self.setStyleSheet("""
             QWidget {
@@ -2140,8 +2189,8 @@ class GameThumbnail(QWidget):
                         rect = QRect(
                             int(piece_x),
                             int(piece_y),
-                            base_piece_size,
-                            base_piece_size
+                            int(base_piece_size),
+                            int(base_piece_size)
                         )
                         
                         if player == 1:
@@ -2167,8 +2216,31 @@ class GameThumbnail(QWidget):
                         painter.setPen(border_color)
                         painter.drawRoundedRect(rect, 2, 2)
         
-        # 如果被选中，绘制蒙版和选中图标
-        if self.is_selected:
+        # 管理模式下显示复选框
+        if hasattr(self.dialog, 'manage_mode') and self.dialog.manage_mode:
+            # 绘制右上角复选框
+            check_size = 24
+            check_x = w - check_size - 5
+            check_y = 5
+            check_rect = QRect(check_x, check_y, check_size, check_size)
+            
+            painter.setPen(Qt.NoPen)
+            if self.is_checked:
+                painter.setBrush(QColor(244, 67, 54)) # 选中时红色（表示删除）
+            else:
+                painter.setBrush(QColor(220, 220, 220)) # 未选中灰色
+            
+            painter.drawEllipse(check_rect)
+            
+            if self.is_checked:
+                # 绘制 X
+                pen = QPen(QColor(255, 255, 255), 2)
+                painter.setPen(pen)
+                painter.drawLine(check_x + 8, check_y + 8, check_x + 16, check_y + 16)
+                painter.drawLine(check_x + 16, check_y + 8, check_x + 8, check_y + 16)
+
+        # 如果被选中（Load 模式），绘制蒙版和选中图标
+        elif self.is_selected:
             # 绘制半透明蓝色蒙版
             overlay_color = QColor(33, 150, 243, 120)  # 半透明蓝色
             painter.setBrush(overlay_color)
@@ -2203,7 +2275,12 @@ class GameThumbnail(QWidget):
     
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.dialog.select_game(self.game_data)
+            if hasattr(self.dialog, 'manage_mode') and self.dialog.manage_mode:
+                self.is_checked = not self.is_checked
+                self.update()
+                self.dialog.on_game_checked(self)
+            else:
+                self.dialog.select_game(self.game_data)
 
 
 class LoadGameDialog(QDialog):
@@ -2212,6 +2289,8 @@ class LoadGameDialog(QDialog):
         self.setWindowTitle("Load Game")
         self.resize(600, 500)
         self.selected_board = None
+        self.manage_mode = False
+        self.checked_thumbnails = set()
         
         self.init_ui()
         self.load_games()
@@ -2221,10 +2300,25 @@ class LoadGameDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
         
-        # Title
+        # Title and Manage Button
+        title_layout = QHBoxLayout()
         title = QLabel("Select a game to load")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #333;")
-        layout.addWidget(title)
+        title_layout.addWidget(title)
+        title_layout.addStretch()
+        
+        self.btn_manage = QPushButton("Manage")
+        self.btn_manage.setFixedSize(80, 30)
+        self.btn_manage.setStyleSheet("""
+            QPushButton {
+                background-color: #fff; border: 1px solid #ccc; border-radius: 4px; color: #333;
+            }
+            QPushButton:hover { background-color: #f5f5f5; }
+        """)
+        self.btn_manage.clicked.connect(self.toggle_manage_mode)
+        title_layout.addWidget(self.btn_manage)
+        
+        layout.addLayout(title_layout)
         
         # 滚动区域
         scroll = QScrollArea()
@@ -2245,6 +2339,21 @@ class LoadGameDialog(QDialog):
         
         # 按钮
         button_layout = QHBoxLayout()
+        
+        self.btn_delete = QPushButton("Delete (0)")
+        self.btn_delete.setFixedSize(100, 36)
+        self.btn_delete.setStyleSheet("""
+            QPushButton {
+                background-color: #F44336; border: none; border-radius: 4px; color: white; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #D32F2F; }
+            QPushButton:pressed { background-color: #B71C1C; }
+            QPushButton:disabled { background-color: #e57373; color: #ffebee; }
+        """)
+        self.btn_delete.clicked.connect(self.delete_selected_games)
+        self.btn_delete.setVisible(False) # Initially hidden
+        button_layout.addWidget(self.btn_delete)
+
         button_layout.addStretch()
         
         btn_cancel = QPushButton("Cancel")
@@ -2339,13 +2448,110 @@ class LoadGameDialog(QDialog):
                         """)
                     widget.update()
 
+    def toggle_manage_mode(self):
+        self.manage_mode = not self.manage_mode
+        
+        if self.manage_mode:
+            self.btn_manage.setText("Done")
+            self.btn_load.setVisible(False)
+            self.btn_delete.setVisible(True)
+            self.btn_delete.setEnabled(False)
+            self.btn_delete.setText("Delete (0)")
+            self.checked_thumbnails.clear()
+            
+            # Clear load selection
+            self.selected_game = None
+            self.selected_board = None
+            self.btn_load.setEnabled(False)
+        else:
+            self.btn_manage.setText("Manage")
+            self.btn_load.setVisible(True)
+            self.btn_delete.setVisible(False)
+            
+            # Clear check selection
+            for t in self.checked_thumbnails:
+                t.is_checked = False
+                t.update()
+            self.checked_thumbnails.clear()
+
+        # Refresh all thumbnails
+        for i in range(self.grid_layout.count()):
+            item = self.grid_layout.itemAt(i)
+            if item and isinstance(item.widget(), GameThumbnail):
+                item.widget().update()
+                item.widget().is_selected = False # Clear single selection
+                # Reset style
+                if not self.manage_mode:
+                     item.widget().setStyleSheet("""
+                        QWidget {
+                            border: 2px solid #ddd;
+                            border-radius: 8px;
+                            background-color: white;
+                        }
+                        QWidget:hover {
+                            border: 2px solid #2196F3;
+                            background-color: #f0f8ff;
+                        }
+                    """)
+
+    def on_game_checked(self, thumbnail):
+        if thumbnail.is_checked:
+            self.checked_thumbnails.add(thumbnail)
+        else:
+            self.checked_thumbnails.discard(thumbnail)
+        
+        count = len(self.checked_thumbnails)
+        self.btn_delete.setText(f"Delete ({count})")
+        self.btn_delete.setEnabled(count > 0)
+
+    def delete_selected_games(self):
+        if not self.checked_thumbnails:
+            return
+            
+        reply = QMessageBox.question(self, "Confirm Delete", 
+                                    f"Are you sure you want to delete {len(self.checked_thumbnails)} games?",
+                                    QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+            
+        # Read, Filter, Write
+        games_file = "custom_games.json"
+        if not os.path.exists(games_file):
+            return
+            
+        try:
+            with open(games_file, 'r', encoding='utf-8') as f:
+                games = json.load(f)
+            
+            names_to_delete = {t.game_data['name'] for t in self.checked_thumbnails}
+            new_games = [g for g in games if g['name'] not in names_to_delete]
+            
+            with open(games_file, 'w', encoding='utf-8') as f:
+                json.dump(new_games, f, ensure_ascii=False, indent=2)
+                
+            # Refresh UI by clearing and reloading
+            while self.grid_layout.count():
+                item = self.grid_layout.itemAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+                self.grid_layout.removeItem(item)
+            
+            self.checked_thumbnails.clear()
+            self.btn_delete.setText("Delete (0)")
+            self.btn_delete.setEnabled(False)
+            
+            self.load_games()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Failed", f"Error deleting games: {str(e)}")
+
 
 def main():
     app = QApplication(sys.argv)
     window = ToppenWindow()
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
